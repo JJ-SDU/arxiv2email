@@ -1,2 +1,4 @@
-arxiv
-requests
+feedparser>=6.0.10
+yagmail>=0.15.293
+requests>=2.31.0
+beautifulsoup4>=4.12.3
