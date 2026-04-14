@@ -27,35 +27,67 @@ jobs:
       - name: Install all dependencies
         run: |
           python -m pip install --upgrade pip
-          # 一次性安装所有需要的依赖，确保不遗漏
           pip install feedparser yagmail requests beautifulsoup4
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run main script
-        run: python main.py
+        id: run-main
+        run: |
+          python main.py
+          echo "main_script_exit_code=$?" >> $GITHUB_OUTPUT
 
-      - name: Send email notification
+      - name: Send detailed email notification
         if: always()
         run: |
-          python -c "
+          python - << 'EOF'
           import yagmail
           import os
           import sys
-          status = '✅ 成功' if sys.argv[1] == '0' else '❌ 失败'
+
+          # 从环境变量读取配置
+          email_user = os.environ.get('EMAIL_USER')
+          email_pass = os.environ.get('EMAIL_PASSWORD')
+          email_to = os.environ.get('EMAIL_TO')
+          email_host = os.environ.get('EMAIL_HOST', 'smtp.163.com')
+          email_port = int(os.environ.get('EMAIL_PORT', 465))
+          main_exit_code = os.environ.get('GITHUB_OUTPUT', '').split('main_script_exit_code=')[-1].split('\n')[0] or '0'
+
+          print(f"=== 邮件发送调试信息 ===")
+          print(f"发件人: {email_user}")
+          print(f"收件人: {email_to}")
+          print(f"SMTP服务器: {email_host}:{email_port}")
+          print(f"主脚本退出码: {main_exit_code}")
+
+          # 状态判断
+          status = '✅ 成功' if main_exit_code == '0' else '❌ 失败'
+          subject = f"[arXiv-Hep-Agent] 任务运行{status} ({os.environ.get('GITHUB_RUN_ID', '未知')})"
+          contents = f"""
+          arXiv-Hep-Agent 任务运行报告
+          ==========================
+          运行状态: {status}
+          主脚本退出码: {main_exit_code}
+          运行ID: {os.environ.get('GITHUB_RUN_ID', '未知')}
+          触发时间: {os.environ.get('GITHUB_RUN_ATTEMPT', '未知')}
+          """
+
           try:
+              # 初始化SMTP连接
               yag = yagmail.SMTP(
-                  user=os.environ['EMAIL_USER'],
-                  password=os.environ['EMAIL_PASSWORD'],
-                  host=os.environ['EMAIL_HOST'],
-                  port=os.environ['EMAIL_PORT'],
-                  smtp_ssl=True
+                  user=email_user,
+                  password=email_pass,
+                  host=email_host,
+                  port=email_port,
+                  smtp_ssl=True,
+                  smtp_starttls=False
               )
+              # 发送邮件
               yag.send(
-                  to=os.environ['EMAIL_TO'],
-                  subject=f'arXiv-Hep-Agent 运行{status}',
-                  contents=f'任务运行状态：{status}\\n退出码：{sys.argv[1]}'
+                  to=email_to,
+                  subject=subject,
+                  contents=contents
               )
-              print('通知邮件发送成功')
+              print("✅ 通知邮件发送成功！")
           except Exception as e:
-              print('邮件发送失败:', e)
-          " ${{ job.status }}
+              print(f"❌ 邮件发送失败，错误详情: {str(e)}")
+              sys.exit(1)
+          EOF
