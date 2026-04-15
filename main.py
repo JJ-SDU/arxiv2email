@@ -1,4 +1,3 @@
-import feedparser
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formatdate
@@ -7,11 +6,12 @@ import os
 import requests
 from bs4 import BeautifulSoup
 
-# ========== 配置 ==========
+# ========== 配置（完全按你要求的网址） ==========
 CATEGORIES = {
     "Experiment (hep-ex)": "hep-ex",
     "Phenomenology (hep-ph)": "hep-ph"
 }
+# 抓取最近1天的文章（和你原来的逻辑一致，可改）
 DAYS_BACK = 1
 
 SMTP_SERVER = os.getenv('EMAIL_HOST', 'smtp.163.com')
@@ -26,85 +26,122 @@ def get_time_window(days=1):
     start = now - timedelta(days=days)
     return start, now
 
-# ========== 作者精简：前3位 + et al.，实验合作组优先显示 ==========
-def format_authors(authors_list, category_code):
-    if not authors_list:
+# ========== 作者精简：实验合作组优先，理论前3位+et al. ==========
+def format_authors(authors_raw, category_code):
+    if not authors_raw:
         return "No authors"
-
-    # hep-ex 实验文章，直接显示 Collaboration
+    # 分割作者列表
+    authors = [a.strip() for a in authors_raw.split(",") if a.strip()]
+    
+    # hep-ex 实验文章：优先显示 Collaboration
     if category_code == "hep-ex":
-        for name in authors_list:
+        for name in authors:
             if "Collaboration" in name:
                 return name
-        if len(authors_list) > 1:
-            return f"{authors_list[0]} et al."
+        if len(authors) > 1:
+            return f"{authors[0]} et al."
         else:
-            return authors_list[0]
-
-    # hep-ph 理论文章，最多显示前3位
-    if len(authors_list) <= 3:
-        return ", ".join(authors_list)
+            return authors[0] if authors else "No authors"
+    
+    # hep-ph 理论文章：最多显示前3位，超过加 et al.
+    if len(authors) <= 3:
+        return ", ".join(authors)
     else:
-        return ", ".join(authors_list[:3]) + " et al."
+        return ", ".join(authors[:3]) + " et al."
 
-# ========== 抓取论文（API 原版，稳定可发邮件）==========
+# ========== 核心抓取：从你指定的 /new 页面完整爬取 ==========
 def fetch_papers(category_code):
-    url = f"http://export.arxiv.org/api/query?search_query=cat:{category_code}&sortBy=submittedDate&sortOrder=descending&max_results=100"
+    # 完全按你给的网址：arxiv.org/list/hep-ph/new / hep-ex/new
+    url = f"https://arxiv.org/list/{category_code}/new?skip=0&show=500"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    }
     try:
-        resp = requests.get(url, timeout=60)
-        feed = feedparser.parse(resp.content)
+        resp = requests.get(url, headers=headers, timeout=120)
+        resp.raise_for_status()  # 捕获请求错误
+        soup = BeautifulSoup(resp.text, "html.parser")
     except Exception as e:
-        print(e)
+        print(f"❌ {category_code} 请求失败: {str(e)}")
         return []
 
     papers = []
     start, end = get_time_window(DAYS_BACK)
 
-    for entry in feed.entries:
+    # 每篇论文对应一个 <dt> 标签
+    for dt in soup.find_all("dt"):
         try:
-            pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        except:
-            try:
-                pub_time = datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=timezone.utc)
-            except:
-                pub_time = datetime.now(timezone.utc)
+            # 1. 提取 arXiv 编号 + 全文链接
+            a_abs = dt.find("a", title="Abstract")
+            if not a_abs:
+                continue
+            arxiv_id = a_abs.text.strip()
+            full_link = f"https://arxiv.org/abs/{arxiv_id}"
 
-        if not (start <= pub_time <= end):
+            # 2. 精准识别公告类型：new / cross-list / replacement
+            span_id = dt.find("span", class_="list-identifier")
+            announce_type = "new"
+            if span_id:
+                id_text = span_id.text.lower()
+                if "replace" in id_text:
+                    announce_type = "replacement"
+                elif "cross" in id_text:
+                    announce_type = "cross-list"
+
+            # 3. 取下一个 <dd> 标签，提取标题、作者、时间
+            dd = dt.find_next_sibling("dd")
+            if not dd:
+                continue
+
+            # 标题
+            title_tag = dd.find("div", class_="list-title")
+            title = title_tag.text.replace("Title:", "").strip() if title_tag else "No title"
+
+            # 作者
+            authors_tag = dd.find("div", class_="list-authors")
+            authors_raw = authors_tag.text.replace("Authors:", "").strip() if authors_tag else ""
+            authors_short = format_authors(authors_raw, category_code)
+
+            # 提交时间（精准解析）
+            dateline = dd.find("div", class_="list-dateline")
+            if not dateline:
+                continue
+            time_str = dateline.text.strip()
+            try:
+                # 解析 "Submitted 15 April 2026" 格式
+                time_part = time_str.replace("Submitted", "").strip()
+                pub_time = datetime.strptime(time_part, "%d %B %Y").replace(tzinfo=timezone.utc)
+            except Exception as e:
+                print(f"⚠️ 时间解析失败: {time_str}, 跳过")
+                continue
+
+            # 4. 时间过滤：只保留最近 DAYS_BACK 天的文章
+            if not (start <= pub_time <= end):
+                continue
+
+            # 5. 存入结果
+            papers.append({
+                "title": title,
+                "arxiv": arxiv_id,
+                "announcement_type": announce_type,
+                "link": full_link,
+                "time": pub_time.strftime("%Y-%m-%d %H:%M UTC"),
+                "authors": authors_short
+            })
+        except Exception as e:
+            print(f"⚠️ 单篇论文解析失败: {str(e)}")
             continue
 
-        # arXiv 编号
-        arxiv_id = entry.id.split('/abs/')[-1] if '/abs/' in entry.id else ""
-
-        # 作者
-        authors = [a.name for a in entry.authors] if hasattr(entry, 'authors') else []
-        author_str = format_authors(authors, category_code)
-
-        # 正确获取 announcement_type：new / cross-list / replacement
-        ann_type = "new"
-        if hasattr(entry, 'arxiv_announcement_type'):
-            ann_type = entry.arxiv_announcement_type
-
-        papers.append({
-            "title": entry.title.strip(),
-            "authors": author_str,
-            "announcement_type": ann_type,
-            "link": entry.link,
-            "arxiv": arxiv_id,
-            "time": pub_time.strftime("%Y-%m-%d %H:%M UTC")
-        })
-
-    print(f"{category_code}: {len(papers)} papers")
+    print(f"✅ {category_code} 抓取完成: {len(papers)} 篇 (new/cross/replace 全覆盖)")
     return papers
 
-# ========== 发送邮件（完全沿用你原来可用的逻辑）==========
+# ========== 发送邮件（完全沿用你原来可用的逻辑，保证能发） ==========
 def send_email(papers_by_cat):
     total = sum(len(ps) for ps in papers_by_cat.values())
     if total == 0:
-        print("No new papers.")
+        print("ℹ️ 最近1天无新论文，不发送邮件")
         return
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     html = f'''
 <html>
 <head>
@@ -120,15 +157,14 @@ h2 {{ color: #24a; margin-top: 30px; }}
     margin: 12px 0;
 }}
 .title {{ font-size: 16px; font-weight: bold; margin-bottom: 8px; }}
-.meta {{ font-size: 13px; color: #555; margin-bottom: 10px; line-height:1.5; }}
-.authors {{ font-size:14px; color:#222; margin-top:6px; }}
+.meta {{ font-size: 13px; color: #555; line-height: 1.5; margin-bottom: 8px; }}
+.authors {{ font-size: 14px; color: #222; }}
 a {{ color: #0066cc; text-decoration: none; }}
 </style>
 </head>
-
 <body>
 <h1>arXiv High Energy Physics Daily Update {today}</h1>
-<p>Includes new, cross-list, replacement papers.</p>
+<p>Source: <a href="https://arxiv.org/list/hep-ph/new" target="_blank">hep-ph/new</a> + <a href="https://arxiv.org/list/hep-ex/new" target="_blank">hep-ex/new</a> (all new/cross/replacement)</p>
 '''
 
     for cat_name, papers in papers_by_cat.items():
@@ -154,14 +190,16 @@ Submitted: {p['time']}
     msg['Date'] = formatdate(localtime=True)
 
     try:
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=60) as server:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=120) as server:
             server.login(SENDER_EMAIL, APP_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-        print("✅ Email sent successfully")
+        print("✅ 邮件发送成功！")
     except Exception as e:
-        print("❌ Failed to send email:", e)
+        print(f"❌ 邮件发送失败: {str(e)}")
 
 # ========== 主入口 ==========
 if __name__ == "__main__":
+    print("🚀 开始从 arXiv /new 页面抓取论文...")
     result = {name: fetch_papers(code) for name, code in CATEGORIES.items()}
     send_email(result)
+    print("🏁 任务完成")
