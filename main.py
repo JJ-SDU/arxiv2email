@@ -26,6 +26,24 @@ def get_time_window(days=1):
     start = now - timedelta(days=days)
     return start, now
 
+# ========== 格式化作者列表：前3位 + et al.，实验合作组直接显示 ==========
+def format_authors(authors_list, category_code):
+    if not authors_list:
+        return ""
+    
+    # 实验类文章 → 直接按合作组显示
+    if category_code == "hep-ex":
+        if len(authors_list) > 1:
+            return f"{authors_list[0]} et al. (Collaboration)"
+        else:
+            return authors_list[0]
+    
+    # 理论类：最多显示前3位，超过加 et al.
+    if len(authors_list) <= 3:
+        return ", ".join(authors_list)
+    else:
+        return ", ".join(authors_list[:3]) + " et al."
+
 # ========== 抓取论文 ==========
 def fetch_papers(category_code):
     url = f"http://export.arxiv.org/api/query?search_query=cat:{category_code}&sortBy=submittedDate&sortOrder=descending"
@@ -43,25 +61,32 @@ def fetch_papers(category_code):
         try:
             pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
         except:
-            pub_time = datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=timezone.utc)
+            pub_time = datetime.strptime(entry.published, "%a, %d %b %Y %:%M:%S %z").replace(tzinfo=timezone.utc)
 
         if not (start <= pub_time <= end):
             continue
 
-        # 提取 arXiv 号
+        # arXiv 编号
         arxiv_id = entry.id.split('/abs/')[-1] if '/abs/' in entry.id else ""
 
-        # 作者
-        authors = [a.name for a in entry.authors] if hasattr(entry, 'authors') else []
-        author_str = ", ".join(authors)
+        # 作者列表
+        authors_raw = [a.name for a in entry.authors] if hasattr(entry, 'authors') else []
+        authors_short = format_authors(authors_raw, category_code)
 
-        # 摘要
-        summary = BeautifulSoup(entry.summary, "html.parser").get_text(strip=True).replace("\n", " ")
+        # 公告类型：new / cross-list / replacement
+        announcement_type = "new"
+        if hasattr(entry, 'arxiv_announcement_type'):
+            announcement_type = entry.arxiv_announcement_type
+        elif hasattr(entry, 'title_detail') and 'replacement' in entry.title_detail.value.lower():
+            announcement_type = "replacement"
+        elif hasattr(entry, 'title_detail') and 'cross-list' in entry.title_detail.value.lower():
+            announcement_type = "cross-list"
 
+        # 不再获取摘要
         papers.append({
             "title": entry.title.strip(),
-            "authors": author_str,
-            "summary": summary,
+            "authors": authors_short,
+            "announcement_type": announcement_type,
             "link": entry.link,
             "arxiv": arxiv_id,
             "time": pub_time.strftime("%Y-%m-%d %H:%M UTC")
@@ -94,35 +119,10 @@ h2 {{ color: #24a; margin-top: 30px; }}
     margin: 12px 0;
 }}
 .title {{ font-size: 16px; font-weight: bold; margin-bottom: 8px; }}
-.meta {{ font-size: 13px; color: #555; margin-bottom: 10px; }}
-.toggle {{
-    color: #0066cc;
-    cursor: pointer;
-    font-size: 14px;
-    margin: 4px 0;
-    display: inline-block;
-}}
-.box {{
-    margin-top: 6px;
-    display: none;
-    font-size: 14px;
-    line-height: 1.6;
-}}
-.authors {{ color: #222; }}
-.summary {{ color: #222; white-space: pre-wrap; }}
+.meta {{ font-size: 13px; color: #555; margin-bottom: 10px; line-height:1.5; }}
+.authors {{ font-size:14px; color:#222; margin-top:6px; }}
 a {{ color: #0066cc; text-decoration: none; }}
 </style>
-
-<script type="text/javascript">
-function toggle(id) {{
-    var el = document.getElementById(id);
-    if (el.style.display === 'none' || el.style.display === '') {{
-        el.style.display = 'block';
-    }} else {{
-        el.style.display = 'none';
-    }}
-}}
-</script>
 </head>
 
 <body>
@@ -133,28 +133,14 @@ function toggle(id) {{
     for cat_name, papers in papers_by_cat.items():
         html += f"<h2>{cat_name} • {len(papers)} papers</h2>"
         for idx, p in enumerate(papers, 1):
-            id_auth = f"a_{idx}_{hash(p['arxiv']) % 99999}"
-            id_abst = f"b_{idx}_{hash(p['arxiv']) % 99999}"
-
             html += f'''
 <div class="paper">
 <div class="title">{idx}. {p['title']}</div>
 <div class="meta">
-arXiv:{p['arxiv']} | <a href="{p['link']}" target="_blank">Full text</a> &nbsp;|&nbsp; {p['time']}
+arXiv:{p['arxiv']} &nbsp;|&nbsp; Type: {p['announcement_type']} &nbsp;|&nbsp; <a href="{p['link']}" target="_blank">Full text</a><br>
+Updated: {p['time']}
 </div>
-
-<div class="toggle" onclick="toggle('{id_auth}')">▼ Authors</div>
-<div class="box" id="{id_auth}">
-<div class="authors">{p['authors']}</div>
-</div>
-
-<div style="height:6px;"></div>
-
-<div class="toggle" onclick="toggle('{id_abst}')">▼ Abstract</div>
-<div class="box" id="{id_abst}">
-<div class="summary">{p['summary']}</div>
-</div>
-
+<div class="authors">Authors: {p['authors']}</div>
 </div>
 '''
 
